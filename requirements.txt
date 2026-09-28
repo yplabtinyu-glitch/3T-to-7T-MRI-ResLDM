@@ -1,0 +1,46 @@
+cat > requirements.txt << 'ZZEOF_REQ'
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# --- core deep learning ---
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+pytorch-lightning==1.6.3
+torchmetrics==1.9.0
+torch-fidelity==0.3.0
+
+# --- medical imaging / data I/O ---
+monai==1.6.0
+nibabel==5.4.2
+SimpleITK==2.4.1
+scikit-image==0.20.0
+
+# --- image processing / augmentation ---
+opencv-python-headless==5.0.0.93
+albumentations==0.4.3
+imgaug==0.2.6
+imageio==2.9.0
+imageio-ffmpeg==0.4.2
+PyWavelets==1.8.0
+
+# --- perceptual loss (used for VAE perceptual loss + LPIPS evaluation) ---
+lpips==0.1.4
+
+# --- numerical / config / utils ---
+numpy==2.2.6
+scipy==1.15.3
+pandas==2.3.3
+omegaconf==2.0.6
+einops==0.3.0
+tqdm==4.70.1
+
+# --- transformer backbone (inherited from base ALDM architecture) ---
+transformers==4.16.2
+
+# --- logging ---
+tensorboard==2.21.0
+test_tube==0.7.5
+
+# --- external repos installed from source (not on PyPI) ---
+git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6#egg=clip
+git+https://github.com/CompVis/taming-transformers.git@3ba01b241669f5ade541ce990f7650a3b8f65318#egg=taming_transformers
+ZZEOF_REQ

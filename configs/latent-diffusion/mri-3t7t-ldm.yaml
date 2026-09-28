@@ -1,0 +1,66 @@
+model:
+  base_learning_rate: 1.0e-05
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    # no ckpt_path here yet -- there is no pretrained full-diffusion
+    # checkpoint to resume from. Leaving this key out entirely (ddpm.py
+    # treats a missing key as ckpt_path=None via kwargs.pop default).
+    linear_start: 0.0015
+    linear_end: 0.0195
+    # z_tgt (the quantity actually noised/denoised in shared_step) has real
+    # std ~1.01-1.04 measured on the frozen AE's output over 5 independent
+    # real batches (batch sizes 4/8/16/32/64) via benchmark_diffusion_real_epoch.py
+    # on 2026-09-24 -- already close to unit variance, so this barely moves
+    # anything, but it's the measured value rather than the untouched default
+    # of 1.0. scale_by_std left False: ddpm.py's built-in scale_by_std
+    # auto-rescale (on_train_batch_start) calls batch[self.first_stage_key]
+    # ("image"), but our batches only have "source"/"target"/"target_class"
+    # keys -- that path would KeyError on the very first training step.
+    scale_factor: 0.987
+    scale_by_std: false
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: image
+    cond_stage_key: image
+    image_size: 16       # latent spatial size for our AE (confirmed via check_latent_shape.py: 128x128 -> 4x16x16)
+    channels: 4           # matches our AE's latent_channels
+    cond_stage_trainable: false
+    conditioning_key: hybrid
+    monitor: val/loss_simple_ema
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        dims: 2                 # <-- critical: UNetModel defaults to dims=3 (Conv3d, for BraTS volumes). Our AE/data is 2D.
+        num_classes: 2          # domain classes: 0 = 3T, 1 = 7T (placeholder convention, adjust when real Dataset is built)
+        image_size: 16
+        in_channels: 12          # 4 (z_tgt/noise) + 8 (c_concat = [z_src, z_srctgt], 4 channels each)
+        out_channels: 4
+        model_channels: 128
+        attention_resolutions:
+        # downsampling-factor convention (not absolute resolution), same as original config
+        - 4
+        - 2
+        num_res_blocks: 1
+        channel_mult:
+        - 1
+        - 1
+        - 2
+        num_head_channels: 32
+        transformer_depth: 1
+        use_spatial_transformer: false
+    first_stage_config:
+      target: ldm.models.frozen_ae_spade.FrozenAEWithSPADE
+      params:
+        ae_checkpoint_path: "~/Desktop/LSC/checkpoints_ae/ae_epoch690.pth"
+        num_classes: 2
+        # WITHOUT this, FrozenAEWithSPADE.__init__'s spade_checkpoint_path
+        # defaults to None -> SPADEGenerator stays randomly initialized.
+        # instantiate_first_stage() then freezes it (requires_grad=False)
+        # BEFORE any diffusion training starts -- so a missing path here
+        # silently trains the whole UNet against untrained, random
+        # domain-conditioning for its entire run, no error anywhere.
+        # Confirmed against the real 10-epoch SPADE training run on
+        # 2026-09-24 (log.csv: val_loss 0.4816 -> 0.4501 over epochs 0-9).
+        spade_checkpoint_path: "~/Desktop/LSC/checkpoints_spade/spade_latest.pth"
+    cond_stage_config: __is_unconditional__

@@ -1,0 +1,34 @@
+# vendored third-party repos -- installed via requirements.txt (git+URL) instead of being committed
+src/clip/
+src/taming-transformers/
+
+# data / patient imaging data -- never committed (license restrictions on HCP / CEREBRUM / AHEAD)
+data/
+*.nii
+*.nii.gz
+
+# checkpoints -- too large for git, keep out
+checkpoints*/
+*.pth
+*.ckpt
+
+# build artifacts
+*.egg-info/
+
+# caches produced by preprocess_spade_cache.py
+spade_cache/
+*_cache/
+
+# logs
+*.log
+lightning_logs/
+tb_logs/
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# editors / OS
+.vscode/
+.DS_Store

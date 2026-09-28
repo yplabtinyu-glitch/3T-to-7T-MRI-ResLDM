@@ -1,0 +1,48 @@
+model:
+  base_learning_rate: 1.0e-05
+  target: ldm.models.diffusion.resshift.LatentResShift
+  params:
+    resshift_T: 15
+    resshift_p: 0.3
+    resshift_kappa: [0.76, 0.33, 0.43, 0.74]   # 起始值,等下用真資料的residual std再確認一次
+    linear_start: 0.0015
+    linear_end: 0.0195
+    scale_factor: 0.987
+    scale_by_std: false
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 15
+    first_stage_key: image
+    cond_stage_key: image
+    image_size: 16
+    channels: 4
+    cond_stage_trainable: false
+    conditioning_key: hybrid
+    monitor: val/loss_simple_ema
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        dims: 2
+        num_classes: 2
+        image_size: 16
+        in_channels: 12
+        out_channels: 4
+        model_channels: 128
+        attention_resolutions:
+        - 4
+        - 2
+        num_res_blocks: 1
+        channel_mult:
+        - 1
+        - 1
+        - 2
+        num_head_channels: 32
+        transformer_depth: 1
+        use_spatial_transformer: false
+    first_stage_config:
+      target: ldm.models.frozen_ae_spade.FrozenAEWithSPADE
+      params:
+        ae_checkpoint_path: "~/Desktop/LSC/checkpoints_ae/ae_epoch690.pth"
+        num_classes: 2
+        spade_checkpoint_path: "~/Desktop/LSC/checkpoints_spade/spade_latest.pth"
+    cond_stage_config: __is_unconditional__
