@@ -75,9 +75,51 @@ from ldm.models.diffusion.ddpm import LatentDiffusion  # <-- VERIFY this class n
 
 class LatentResShift(LatentDiffusion):
     def __init__(self, resshift_T=15, resshift_p=0.3, resshift_kappa=2.0,
+                 ablation_no_condition=False,
+                 y0_source='spade',
+                 lambda_mind=0.0,
+                 mind_brain_thr=0.02,
+                 lambda_lf=0.0,
+                 lf_factor=8,
+                 condition_select='all',
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.num_timesteps = resshift_T
+        # ablation (老師指示, 2026-09): UNet完全不吃c_concat(z_src+z_srctgt)跟
+        # c_crossattn(class label)這兩個額外condition,只看noisy latent本身。
+        # y0(z_srctgt)完全不受影響 -- 它是ResShift自己forward/reverse process的
+        # 數學錨點,不是"餵給UNet的condition",SPADE的3T->7T轉換照樣算、照樣用。
+        # 實作上為什麼不能只靠yaml改conditioning_key:
+        #   - conditioning_key設null時,LatentDiffusion.__init__有段backward-
+        #     compat邏輯「if conditioning_key is None: conditioning_key =
+        #     'concat' if concat_mode else 'crossattn'」,會把null偷偷改成
+        #     'concat',不是真的None,送進DiffusionWrapper後conditioning_key
+        #     根本不是None。(2026-10-01, 實際跑check_ablation_config_shapes.py
+        #     炸出來才發現這個,之前光讀code沒注意到這段)
+        #   - 'concat'分支寫的是`torch.cat([x] + c_concat, dim=1)`,預期
+        #     c_concat是list,但我們的get_input()給的是tensor,一樣會炸
+        #     (TypeError: can only concatenate list (not "Tensor") to list)
+        #   - 'crossattn'分支也預期c_crossattn是list、且是用在真的cross-attention
+        #     (context_dim需對上),跟我們的class label(純一個int tensor)完全
+        #     對不上,這條路也走不通
+        # 所以保留conditioning_key: hybrid不變(這是目前唯一跟get_input()的
+        # tensor格式相容的分支),改成讓c_concat變成0-channel tensor(等於沒接
+        # 任何東西進去,torch.cat後channel數不變)、c_crossattn直接設None
+        # (UNetModel.forward有 `assert (y is not None) == (self.num_classes
+        # is not None)`,所以yaml那邊num_classes也要拿掉，這點跟之前講的一樣)。
+        self.ablation_no_condition = ablation_no_condition
+        assert y0_source in ('spade', '3t'), y0_source
+        self.y0_source = y0_source
+        self.lambda_mind = float(lambda_mind)
+        self.mind_brain_thr = float(mind_brain_thr)
+        self.lambda_lf = float(lambda_lf)
+        self.lf_factor = int(lf_factor)
+        if self.lambda_lf > 0:
+            print(f'[LF] low-frequency anchor to SPADE on: lambda_lf={self.lambda_lf}, pool={self.lf_factor}')
+        if self.lambda_mind > 0:
+            print(f'[MIND] structure loss on: lambda_mind={self.lambda_mind}')
+        assert condition_select in ('all', '3t', 'spade'), condition_select
+        self.condition_select = condition_select
         # resshift_kappa may arrive as a plain float (old behavior) or as an
         # OmegaConf ListConfig (from a yaml list like [0.76, 0.33, 0.43,
         # 0.74]) -- ListConfig isn't a type torch.as_tensor recognizes
@@ -143,7 +185,17 @@ class LatentResShift(LatentDiffusion):
     # instead of only inside the concatenated cond dict ----
     def get_input_resshift(self, batch, k, *args, **kwargs):
         x_start, cond = super().get_input(batch, k, *args, **kwargs)
-        y0 = cond['c_concat'][:, 4:8, ...].clone()  # VERIFY channel split, see module docstring
+        y0 = (cond['c_concat'][:, 0:4, ...] if self.y0_source == '3t' else cond['c_concat'][:, 4:8, ...]).clone()  # 0:4 raw 3T latent, 4:8 SPADE latent
+        self._z3t_for_mind = cond['c_concat'][:, 0:4, ...].detach()  # 3T latent (scaled), for the MIND loss
+        self._zsp_for_lf = cond['c_concat'][:, 4:8, ...].detach()  # SPADE latent (scaled), low-frequency anchor
+        if self.ablation_no_condition:
+            b = x_start.shape[0]
+            zero_concat = x_start.new_zeros((b, 0, *x_start.shape[2:]))
+            cond = {'c_concat': zero_concat, 'c_crossattn': None}
+        elif self.condition_select == '3t':
+            cond = {'c_concat': cond['c_concat'][:, 0:4, ...], 'c_crossattn': cond['c_crossattn']}  # raw 3T latent only
+        elif self.condition_select == 'spade':
+            cond = {'c_concat': cond['c_concat'][:, 4:8, ...], 'c_crossattn': cond['c_crossattn']}  # SPADE latent only
         return x_start, y0, cond
 
     # ---- training loss ----
@@ -154,7 +206,40 @@ class LatentResShift(LatentDiffusion):
         loss = F.mse_loss(x0_pred, x_start, reduction='none')
         loss = loss.mean(dim=list(range(1, loss.ndim)))
         loss_dict = {'loss_simple': loss.mean().detach()}
-        return loss.mean(), loss_dict
+        total = loss.mean()
+        if self.lambda_mind > 0 or self.lambda_lf > 0:
+            fsm = self.first_stage_model
+            dec = getattr(type(fsm).decode, "__wrapped__", None)
+            if dec is None:
+                raise RuntimeError("first_stage_model.decode has no __wrapped__ -- cannot backprop through the decoder")
+            img_pred = (dec(fsm, x0_pred / self.scale_factor).float() + 1) / 2
+            with torch.no_grad():
+                img_3t = (fsm.decode(self._z3t_for_mind / self.scale_factor).float().clamp(-1, 1) + 1) / 2
+            if torch.is_grad_enabled() and not img_pred.requires_grad:
+                raise RuntimeError("decoded x0_pred has no grad -- MIND loss would not train the UNet")
+
+            def _mind(x, eps=1e-3):
+                H, W = x.shape[-2:]
+                p = F.pad(x, (1, 1, 1, 1), mode="replicate")
+                D = torch.cat([F.avg_pool2d((x - p[:, :, 1 + dy:1 + dy + H, 1 + dx:1 + dx + W]) ** 2, 3, stride=1, padding=1)
+                               for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0))], 1)
+                V = D.mean(1, keepdim=True).clamp_min(eps)
+                M = torch.exp(-D / V)
+                return M / M.amax(1, keepdim=True).clamp_min(eps)
+
+            bm = (img_3t > self.mind_brain_thr).float()
+            l_mind = ((_mind(img_pred) - _mind(img_3t)).abs().mean(1, keepdim=True) * bm).sum() / bm.sum().clamp_min(1.0)
+            total = total + self.lambda_mind * l_mind
+            loss_dict['loss_mind'] = l_mind.detach()
+            if self.lambda_lf > 0:
+                with torch.no_grad():
+                    img_sp = (fsm.decode(self._zsp_for_lf / self.scale_factor).float().clamp(-1, 1) + 1) / 2
+                f_ = self.lf_factor
+                bml = (F.avg_pool2d(bm, f_) > 0.5).float()
+                l_lf = ((F.avg_pool2d(img_pred, f_) - F.avg_pool2d(img_sp, f_)).abs() * bml).sum() / bml.sum().clamp_min(1.0)
+                total = total + self.lambda_lf * l_lf
+                loss_dict['loss_lf'] = l_lf.detach()
+        return total, loss_dict
 
     def shared_step(self, batch):
         # overrides LatentDiffusion.shared_step BY NAME (not a new method) so

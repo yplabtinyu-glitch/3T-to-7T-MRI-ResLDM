@@ -139,6 +139,17 @@ class CachedSpadePairDataset(Dataset):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--lambda_mind", type=float, default=0.0, help="MIND structure loss: decoded SPADE output vs INPUT 3T (aligned)")
+    ap.add_argument("--lambda_back", type=float, default=0.0, help="train reverse path: L1(SPADE(z_7T, class0), z_3T) (latent)")
+    ap.add_argument("--lambda_cyc", type=float, default=0.0, help="cycle: L1(SPADE(SPADE(z_3T,1)+noise, class0), z_3T) (latent)")
+    ap.add_argument("--cyc_noise", type=float, default=0.1, help="std of noise added to z_fake7T before the back pass (anti-steganography)")
+    ap.add_argument("--mind_brain_thr", type=float, default=0.02, help="MIND loss averaged over 3T voxels > thr ([0,1])")
+    ap.add_argument("--lambda_latent", type=float, default=1.0, help="weight of original latent L1")
+    ap.add_argument("--lambda_l1", type=float, default=1.0, help="image L1 vs 7T ([0,1])")
+    ap.add_argument("--lambda_ssim", type=float, default=1.0, help="(1-SSIM) vs 7T ([0,1])")
+    ap.add_argument("--lambda_lpips", type=float, default=0.1, help="LPIPS(vgg) vs 7T")
+    ap.add_argument("--ae_script_dir", default=".", help="dir containing train_autoencoder.py (for auto_ssim_kernel)")
+    ap.add_argument("--ssim_num_patches", type=int, default=24, help="num_patches passed to auto_ssim_kernel")
     ap.add_argument("--csv_path", default=os.path.expanduser("~/Desktop/data/pairs_ventricle.csv"))
     ap.add_argument("--data_dir", default=os.path.expanduser("~/Desktop/data"))
     ap.add_argument("--cache_dir", default=os.path.expanduser("~/Desktop/data/spade_cache"))
@@ -215,14 +226,109 @@ def main():
     log_file = open(log_path, "a", newline="")
     log_writer = csv.writer(log_file)
     if log_is_new:
-        log_writer.writerow(["epoch", "step", "global_step", "train_loss", "sec_per_step", "val_loss"])
+        log_writer.writerow(["epoch", "train_total", "train_latent", "train_l1", "train_ssim", "train_lpips", "train_mind", "train_back", "train_cyc", "val_total", "val_latent", "val_l1", "val_ssim", "val_lpips", "val_mind", "val_back", "val_cyc", "sec"])
+
+    import collections as _collections
+    import os as _os
+    import sys as _sys
+    import time as _time
+    from torchmetrics.functional.image import structural_similarity_index_measure as _ssim_fn
+
+    _img_on = (args.lambda_l1 > 0) or (args.lambda_ssim > 0) or (args.lambda_lpips > 0) or (args.lambda_mind > 0)
+    _dec_raw = getattr(type(model).decode, "__wrapped__", None)   # decode without @torch.no_grad
+    if _img_on and _dec_raw is None:
+        raise RuntimeError("FrozenAEWithSPADE.decode has no __wrapped__ -- cannot get a grad-enabled decode")
+    for _p in model.ae.parameters():
+        _p.requires_grad_(False)          # AE stays frozen; gradients still flow THROUGH it to SPADE
+
+    try:
+        _sys.path.insert(0, _os.path.expanduser(args.ae_script_dir))
+        import train_autoencoder as _ae_mod
+        _ssim_k = _ae_mod.auto_ssim_kernel(128, args.ssim_num_patches)
+        print(f"[imgloss] SSIM kernel from train_autoencoder.auto_ssim_kernel(128, {args.ssim_num_patches}) = {_ssim_k}")
+    except Exception as _e:
+        _ssim_k = (11, 1.5)
+        print(f"[imgloss][warn] could not use auto_ssim_kernel ({_e}); fallback SSIM kernel {_ssim_k}")
+
+    def _mind(x, eps=1e-3):
+        """2D MIND (Heinrich 2012): 4-neighbour patch SSD (3x3 box), normalised by local variance. x: Bx1xHxW [0,1]"""
+        H, W = x.shape[-2:]
+        p = F.pad(x, (1, 1, 1, 1), mode="replicate")
+        D = torch.cat([F.avg_pool2d((x - p[:, :, 1 + dy:1 + dy + H, 1 + dx:1 + dx + W]) ** 2, 3, stride=1, padding=1)
+                       for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0))], 1)
+        V = D.mean(1, keepdim=True).clamp_min(eps)
+        M = torch.exp(-D / V)
+        return M / M.amax(1, keepdim=True).clamp_min(eps)
+
+    _lp = {}
+    def _lpips_net(dev):
+        if dev not in _lp:
+            import lpips
+            net = lpips.LPIPS(net="vgg").to(dev).eval()
+            for _p in net.parameters():
+                _p.requires_grad_(False)
+            _lp[dev] = net
+        return _lp[dev]
+
+    _last = {}
+    _chk = {"grad": False, "range": False}
+    print(f"[imgloss] lambda latent={args.lambda_latent} l1={args.lambda_l1} ssim={args.lambda_ssim} "
+          f"lpips={args.lambda_lpips}  (image losses {'ON' if _img_on else 'OFF'})")
 
     def spade_l1_loss(src, tgt, y):
         with torch.no_grad():
             z_src, _, _ = model.encode(src)
             z_tgt, _, _ = model.encode(tgt)
         z_srctgt = model.spade(z_src, y)
-        return F.l1_loss(z_srctgt, z_tgt)
+        loss_lat = F.l1_loss(z_srctgt, z_tgt)
+        total = args.lambda_latent * loss_lat
+        _last.clear()
+        _last["latent"] = loss_lat.item()
+        if _img_on:
+            img = _dec_raw(model, z_srctgt)
+            if torch.is_grad_enabled() and not _chk["grad"]:
+                if not img.requires_grad:
+                    raise RuntimeError("decoded image has no grad -- decode path blocks gradients")
+                _chk["grad"] = True
+                print("[imgloss] check OK: gradient flows through decoder to SPADE")
+            t = tgt.to(img.device).float()
+            if t.dim() == 3:
+                t = t.unsqueeze(1)
+            if t.shape != img.shape:
+                raise RuntimeError(f"decoded {tuple(img.shape)} vs target {tuple(t.shape)} shape mismatch")
+            if not _chk["range"]:
+                _chk["range"] = True
+                print(f"[imgloss] decoded range [{img.min().item():.3f}, {img.max().item():.3f}], "
+                      f"target range [{t.min().item():.3f}, {t.max().item():.3f}]  (both expected ~[-1,1])")
+            g01 = (img.float() + 1) / 2
+            t01 = (t.clamp(-1, 1) + 1) / 2
+            l_l1 = F.l1_loss(g01, t01)
+            s = _ssim_fn(g01, t01, data_range=1.0, kernel_size=_ssim_k[0], sigma=_ssim_k[1])
+            if args.lambda_lpips > 0:
+                l_lp = _lpips_net(img.device)((g01 * 2 - 1).repeat(1, 3, 1, 1), (t01 * 2 - 1).repeat(1, 3, 1, 1)).mean()
+            else:
+                l_lp = torch.zeros((), device=img.device)
+            total = total + args.lambda_l1 * l_l1 + args.lambda_ssim * (1 - s) + args.lambda_lpips * l_lp
+            _last.update(l1=l_l1.item(), ssim=s.item(), lpips=l_lp.item())
+            if args.lambda_mind > 0:
+                x3 = src.to(img.device).float()
+                x3 = (x3.unsqueeze(1) if x3.dim() == 3 else x3).clamp(-1, 1)
+                x3 = (x3 + 1) / 2
+                bm = (x3 > args.mind_brain_thr).float()
+                l_mind = ((_mind(g01) - _mind(x3)).abs().mean(1, keepdim=True) * bm).sum() / bm.sum().clamp_min(1.0)
+                total = total + args.lambda_mind * l_mind
+                _last['mind'] = l_mind.item()
+        _y3t = torch.zeros_like(y)  # class 0 = 3T
+        if args.lambda_back > 0:
+            l_back = F.l1_loss(model.spade(z_tgt, _y3t), z_src)
+            total = total + args.lambda_back * l_back
+            _last['back'] = l_back.item()
+        if args.lambda_cyc > 0:
+            z_rec = model.spade(z_srctgt + args.cyc_noise * torch.randn_like(z_srctgt), _y3t)
+            l_cyc = F.l1_loss(z_rec, z_src)
+            total = total + args.lambda_cyc * l_cyc
+            _last['cyc'] = l_cyc.item()
+        return total
 
     global_step = args.start_epoch * len(train_loader)
     train_start = time.time()
@@ -231,6 +337,7 @@ def main():
         running = 0.0
         running_n = 0
         window_start = time.time()
+        _tr, _tr_n, _ep_t0 = _collections.defaultdict(float), 0, _time.time()
         for i, (src, tgt, y) in enumerate(train_loader):
             src, tgt, y = src.to(device), tgt.to(device), y.to(device)
             opt.zero_grad()
@@ -238,6 +345,10 @@ def main():
             loss.backward()
             opt.step()
             running += loss.item()
+            _tr['total'] += loss.item()
+            for _k, _v in _last.items():
+                _tr[_k] += _v
+            _tr_n += 1
             running_n += 1
             global_step += 1
 
@@ -251,7 +362,6 @@ def main():
                 avg_loss = running / running_n
                 print(f"[epoch {epoch}] step {i+1}/{len(train_loader)}  "
                       f"train_loss={avg_loss:.5f}  {sec_per_step*1000:.1f} ms/step")
-                log_writer.writerow([epoch, i + 1, global_step, avg_loss, sec_per_step, ""])
                 log_file.flush()
                 running, running_n = 0.0, 0
                 window_start = time.time()
@@ -259,13 +369,24 @@ def main():
         model.spade.eval()
         val_loss = 0.0
         with torch.no_grad():
+            _va, _va_n = _collections.defaultdict(float), 0
             for src, tgt, y in val_loader:
                 src, tgt, y = src.to(device), tgt.to(device), y.to(device)
-                val_loss += spade_l1_loss(src, tgt, y).item()
+                _vl = spade_l1_loss(src, tgt, y).item()
+                val_loss += _vl
+                _va['total'] += _vl
+                for _k, _v in _last.items():
+                    _va[_k] += _v
+                _va_n += 1
         val_loss /= max(1, len(val_loader))
         print(f"=== epoch {epoch} done | val_loss={val_loss:.5f} | "
               f"elapsed so far: {(time.time()-train_start)/60:.1f} min ===")
-        log_writer.writerow([epoch, "epoch_end", global_step, "", "", val_loss])
+        _K = ('total', 'latent', 'l1', 'ssim', 'lpips', 'mind', 'back', 'cyc')
+        _f = lambda d, n, k: (d[k] / n) if (n and k in d) else ''
+        log_writer.writerow([epoch] + [_f(_tr, _tr_n, k) for k in _K] + [_f(_va, _va_n, k) for k in _K]
+                            + [round(_time.time() - _ep_t0, 1)])
+        print('[imgloss] epoch', epoch, ' train', {k: round(_f(_tr, _tr_n, k), 5) for k in _K if k in _tr},
+              ' val', {k: round(_f(_va, _va_n, k), 5) for k in _K if k in _va})
         log_file.flush()
 
         ckpt_path = os.path.join(args.out_dir, f"spade_epoch{epoch}.pth")

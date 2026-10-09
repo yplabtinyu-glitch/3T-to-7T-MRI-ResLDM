@@ -32,3 +32,21 @@ __pycache__/
 # editors / OS
 .vscode/
 .DS_Store
+
+# patch backups / one-off patch scripts (patched source is committed)
+*.bak*
+patch_*.py
+fix_*.py
+# experiment outputs
+*.npy
+*.png
+eval_*/
+eval_*.csv
+compare_spade_*.csv
+slice_compare_*.csv
+spade_*.csv
+spade_*.txt
+latent_dist*
+.~lock*
+configs/latent-diffusion/_tmp*
+nohup.out

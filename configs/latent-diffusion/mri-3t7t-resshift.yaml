@@ -44,5 +44,5 @@ model:
       params:
         ae_checkpoint_path: "~/Desktop/LSC/checkpoints_ae/ae_epoch690.pth"
         num_classes: 2
-        spade_checkpoint_path: "~/Desktop/LSC/checkpoints_spade/spade_latest.pth"
+        spade_checkpoint_path: "/home/ubuntu/Desktop/LSC/checkpoints_spade/spade_latest.pth"
     cond_stage_config: __is_unconditional__
